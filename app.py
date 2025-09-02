@@ -1,87 +1,95 @@
-"""Flask application for classifying plant leaves.
+# app.py
+import os
+from pathlib import Path
 
-The application exposes a web interface where users can upload an image of a
-leaf.  The image is processed by a TensorFlow model which returns the predicted
-class along with a confidence score.  Results are rendered in a simple HTML
-template.
-"""
+# --- (Optional) quiet TensorFlow logs BEFORE importing TF ---
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")        # hide info/warn
+# os.environ.setdefault("TF_ENABLE_ONEDNN_OPTS", "0")     # disable oneDNN msgs/ops
 
-from __future__ import annotations
-
-import numpy as np
 import tensorflow as tf
-from flask import Flask, redirect, render_template, request, url_for
+from flask import Flask, request, render_template
+import numpy as np
 from PIL import Image
 
+# ---------------------------
+# Model File (robust absolute path)
+# ---------------------------
+BASE_DIR = Path(__file__).resolve().parent
+MODEL_PATH = BASE_DIR / "leaf_classifier_model.keras"   # adjust if you move it
+
+if not MODEL_PATH.exists():
+    print("Model file not found at", MODEL_PATH)
+
+def load_tf_model(path: Path):
+    # TF 2.15 / Keras 2.x: compile=False avoids optimizer rebuild on load
+    return tf.keras.models.load_model(str(path), compile=False)
+
+# Try to load the model; fail gracefully
+model = None
+try:
+    if MODEL_PATH.exists():
+        print("Loading model from:", MODEL_PATH)
+        model = load_tf_model(MODEL_PATH)
+        print("Model loaded.")
+    else:
+        print("Skipping load: file missing.")
+except Exception as e:
+    print("Model load failed:", e)
+
+model_name = MODEL_PATH.name
+
+# ---------------------------
+# Flask app
+# ---------------------------
 app = Flask(__name__)
-app.config["MAX_CONTENT_LENGTH"] = 16 * 1024 * 1024  # 16 MB upload limit
-
-# Load the trained model once at start‑up.  The file shipped with the exercise
-# uses the ``.keras`` format, so make sure we point to the correct path.
-MODEL_PATH = "leaf_classifier_model.keras"
-MODEL = tf.keras.models.load_model(MODEL_PATH)
-
-# Optional mapping from numeric class index to human readable label.  Adjust
-# these names to match the classes used when training the model.
-CLASS_NAMES = ["Class 0", "Class 1", "Class 2", "Class 3"]
-
-
-def preprocess_image(image: Image.Image) -> np.ndarray:
-    """Resize and normalise the uploaded image for the model.
-
-    Parameters
-    ----------
-    image:
-        A Pillow image instance uploaded by the user.
-
-    Returns
-    -------
-    numpy.ndarray
-        A ``(1, 224, 224, 3)`` float32 array with values in the range
-        ``[0, 1]`` ready for prediction.
-    """
-
-    image = image.convert("RGB")  # ensure three colour channels
-    image = image.resize((224, 224))
-    img_array = np.asarray(image, dtype=np.float32) / 255.0
-    return np.expand_dims(img_array, axis=0)
-
 
 @app.route("/")
-def index() -> str:
-    """Render the upload form."""
+def index():
+    # Ensure you have templates/index.html in: <project>/templates/index.html
     return render_template("index.html")
 
+@app.route("/health")
+def health():
+    return {
+        "tensorflow": tf.__version__,
+        "model_loaded": model is not None,
+        "model_name": model_name,
+        "model_path": str(MODEL_PATH),
+    }, 200
 
 @app.route("/predict", methods=["POST"])
-def predict() -> str:
-    """Handle image uploads and display prediction results."""
+def predict():
+    if model is None:
+        return f"Model not loaded. Expected at: {MODEL_PATH}", 500
 
     if "file" not in request.files:
-        return redirect(url_for("index"))
+        return "No file uploaded", 400
 
     file = request.files["file"]
-    if file.filename == "":
-        return redirect(url_for("index"))
+    if not file.filename:
+        return "No file selected", 400
 
-    image = Image.open(file.stream)
-    img_array = preprocess_image(image)
-    prediction = MODEL.predict(img_array)
-    predicted_index = int(np.argmax(prediction[0]))
-    confidence = float(np.max(prediction[0]))
+    # ---- Image preprocessing ----
+    # If you trained with MobileNetV2 preprocessing, uncomment the two lines marked (MNv2)
+    image = Image.open(file.stream).convert("RGB").resize((224, 224))
 
-    label = (
-        CLASS_NAMES[predicted_index]
-        if predicted_index < len(CLASS_NAMES)
-        else str(predicted_index)
-    )
+    # (Default) simple rescaling:
+    arr = (np.array(image, dtype=np.float32) / 255.0)[None, ...]  # shape: (1, 224, 224, 3)
 
-    return render_template(
-        "result.html",
-        label=label,
-        confidence=f"{confidence:.2%}",
-    )
+    # (MNv2) use this instead of the line above if you trained with MobileNetV2 preprocessing:
+    # from tensorflow.keras.applications.mobilenet_v2 import preprocess_input
+    # arr = preprocess_input(np.array(image, dtype=np.float32))[None, ...]
 
+    # ---- Inference ----
+    preds = model.predict(arr)
+    class_id = int(np.argmax(preds, axis=1)[0])
 
-if __name__ == "__main__":  # pragma: no cover - manual run
-    app.run(debug=True)
+    # If you have a class-name list, map here:
+    # classes = ["classA", "classB", "classC", ...]
+    # return {"prediction": classes[class_id], "class_id": class_id}, 200
+
+    return {"prediction": class_id}, 200
+
+if __name__ == "__main__":
+    # On Windows, the reloader can execute code twice; disable if it causes issues
+    app.run(debug=True, use_reloader=False)
